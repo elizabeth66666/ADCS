@@ -17,16 +17,26 @@ What runs, and how
   WheelSpeedMonitor run as background daemon threads, continuously updating
   their readings.
 - QRCodeStreamer serves the video feed plus a /status endpoint reporting
-  that telemetry as JSON; its dashboard page - at
-  http://<this device's IP>:5000/ - polls /status once a second and shows
-  it next to the live camera stream with QR pose overlaid.
-- Motor control is keyboard-driven from whatever device has the dashboard
-  page open, not from this process's own terminal: the page listens for
-  keydown events (w/up faster, s/down slower, f forward, r reverse, space
-  stop) and POSTs them to /control, which calls
-  Drivetrain.keyboard.handle_key() - no on-screen buttons to click. Run
-  `python3 drivetrain.py` directly instead if you want local terminal
-  keyboard control (SSH'd into this device) rather than browser-based.
+  that telemetry as JSON, and accepts POST /control and /heartbeat for
+  remote motor control (see ui/index.html below).
+- Motor control is keyboard-driven from whatever device is viewing the UI,
+  not from this process's own terminal: keydown events (w/up faster,
+  s/down slower, f forward, r reverse, space stop) get POSTed to /control,
+  which calls Drivetrain.keyboard.handle_key() - no on-screen buttons to
+  click. Run `python3 drivetrain.py` directly instead if you want local
+  terminal keyboard control (SSH'd into this device) rather than
+  browser-based.
+
+Two ways to view the dashboard from another device
+-----------------------------------------------------
+1. Point a browser straight at http://<this device's IP>:5000/ - Flask
+   serves a built-in dashboard page (see qr_code_streamer.py's _index()).
+2. Open ui/index.html - a standalone, dependency-free page meant to be
+   copied onto and opened from a separate device (laptop, phone). Enter
+   this device's address (e.g. http://192.168.1.42:5000) in its connect
+   bar; it talks to the same /video, /status, /control, and /heartbeat
+   endpoints over the network. CORS headers on those routes (added in
+   qr_code_streamer.py) are what make this cross-origin access possible.
 
 Ctrl+C stops every subsystem and releases the camera/GPIO/SPI/I2C handles.
 """

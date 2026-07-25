@@ -212,6 +212,19 @@ class QRCodeStreamer:
         self._new_camera_matrix = None
 
         self.app = Flask(__name__)
+
+        @self.app.after_request
+        def _allow_cross_origin(response):
+            # ui/index.html runs as a static file on a separate device, so
+            # it's a different origin than this Flask server - without
+            # these headers the browser blocks its fetch() calls to
+            # /status, /control, and /heartbeat (the <img> video tag
+            # doesn't need this; cross-origin images don't require CORS).
+            response.headers["Access-Control-Allow-Origin"] = "*"
+            response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+            response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+            return response
+
         self.app.add_url_rule("/", "index", self._index)
         self.app.add_url_rule("/video", "video", self._video)
         if self._status_provider is not None:

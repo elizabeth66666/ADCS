@@ -1,0 +1,361 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rover Control Dashboard</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #12161c;
+    --panel: #1b212a;
+    --border: #2a323d;
+    --text: #e6e9ef;
+    --muted: #8b96a5;
+    --ok: #3ddc84;
+    --warn: #e8b84b;
+    --bad: #e05a5a;
+    --accent: #4d9cff;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, Segoe UI, Roboto, sans-serif;
+  }
+  header {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.75rem;
+    padding: 0.75rem 1rem;
+    border-bottom: 1px solid var(--border);
+  }
+  header h1 {
+    font-size: 1.1rem;
+    margin: 0;
+    margin-right: auto;
+  }
+  #base-url {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: 0.4rem 0.6rem;
+    border-radius: 6px;
+    min-width: 15rem;
+    font-family: monospace;
+  }
+  button {
+    background: var(--accent);
+    color: #06121f;
+    border: none;
+    padding: 0.45rem 0.9rem;
+    border-radius: 6px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  button.disconnect { background: var(--bad); }
+  #conn-dot {
+    width: 0.6rem;
+    height: 0.6rem;
+    border-radius: 50%;
+    background: var(--muted);
+    display: inline-block;
+  }
+  #conn-dot.ok { background: var(--ok); }
+  #conn-dot.bad { background: var(--bad); }
+  #conn-label { color: var(--muted); font-size: 0.9rem; }
+
+  main {
+    display: grid;
+    grid-template-columns: minmax(0, 2fr) minmax(18rem, 1fr);
+    gap: 1rem;
+    padding: 1rem;
+  }
+  @media (max-width: 800px) {
+    main { grid-template-columns: 1fr; }
+  }
+
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 1rem;
+  }
+  .panel h2 {
+    margin: 0 0 0.75rem;
+    font-size: 0.95rem;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+
+  #video-wrap {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: #000;
+    border-radius: 8px;
+    overflow: hidden;
+    min-height: 16rem;
+  }
+  #video-feed { width: 100%; display: block; }
+  #video-placeholder { color: var(--muted); padding: 2rem; text-align: center; }
+
+  .field-row {
+    display: flex;
+    justify-content: space-between;
+    padding: 0.3rem 0;
+    border-bottom: 1px solid var(--border);
+    font-size: 0.92rem;
+  }
+  .field-row:last-child { border-bottom: none; }
+  .field-label { color: var(--muted); }
+  .badge {
+    font-size: 0.7rem;
+    padding: 0.05rem 0.4rem;
+    border-radius: 4px;
+    margin-left: 0.4rem;
+    background: var(--warn);
+    color: #241a00;
+  }
+  .banner {
+    margin-top: 0.6rem;
+    padding: 0.5rem 0.7rem;
+    border-radius: 6px;
+    background: var(--bad);
+    color: #240808;
+    font-weight: 600;
+    font-size: 0.85rem;
+  }
+
+  #control-log {
+    margin-top: 0.6rem;
+    font-family: monospace;
+    font-size: 0.85rem;
+    color: var(--muted);
+  }
+  kbd {
+    background: #0e1319;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 0.05rem 0.4rem;
+    font-family: monospace;
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Rover Control Dashboard</h1>
+  <span id="conn-dot"></span>
+  <span id="conn-label">Disconnected</span>
+  <input id="base-url" type="text" placeholder="http://192.168.1.42:5000" autocomplete="off">
+  <button id="connect-btn">Connect</button>
+</header>
+
+<main>
+  <section class="panel">
+    <h2>Camera</h2>
+    <div id="video-wrap">
+      <div id="video-placeholder">Not connected</div>
+      <img id="video-feed" style="display:none">
+    </div>
+  </section>
+
+  <div style="display:flex; flex-direction:column; gap:1rem;">
+    <section class="panel">
+      <h2>Status</h2>
+      <div id="status-fields">
+        <div class="field-row"><span class="field-label">CPU temp</span><span id="f-cpu-temp">-</span></div>
+        <div class="field-row"><span class="field-label">Thermocouple</span><span id="f-thermo-temp">-</span></div>
+        <div class="field-row"><span class="field-label">Battery voltage</span><span id="f-batt-voltage">-</span></div>
+        <div class="field-row"><span class="field-label">Battery current</span><span id="f-batt-current">-</span></div>
+        <div class="field-row"><span class="field-label">Battery capacity</span><span id="f-batt-capacity">-</span></div>
+        <div class="field-row"><span class="field-label">Wheel RPM</span><span id="f-wheel-rpm">-</span></div>
+        <div class="field-row"><span class="field-label">Wheel speed</span><span id="f-wheel-speed">-</span></div>
+        <div class="field-row"><span class="field-label">Direction</span><span id="f-wheel-dir">-</span></div>
+      </div>
+      <div id="low-voltage-banner" class="banner" style="display:none">Battery at/below minimum voltage</div>
+    </section>
+
+    <section class="panel">
+      <h2>Motor control</h2>
+      <p style="margin-top:0; color: var(--muted); font-size: 0.9rem;">
+        Click anywhere on this page first so it has keyboard focus, then use:
+        <br><kbd>w</kbd>/<kbd>&uarr;</kbd> faster &nbsp;
+        <kbd>s</kbd>/<kbd>&darr;</kbd> slower &nbsp;
+        <kbd>f</kbd> forward &nbsp;
+        <kbd>r</kbd> reverse &nbsp;
+        <kbd>space</kbd> stop
+      </p>
+      <p style="color: var(--muted); font-size: 0.85rem;">
+        The rover stops the motor automatically if this page disconnects.
+      </p>
+      <div id="control-log">no commands sent yet</div>
+    </section>
+  </div>
+</main>
+
+<script>
+(() => {
+  const STATUS_POLL_MS = 1000;
+  const HEARTBEAT_MS = 500;   // keep well under the server's control_timeout_s (default 2s)
+
+  const CONTROL_KEY_MAP = {
+    "w": "w", "ArrowUp": "up",
+    "s": "s", "ArrowDown": "down",
+    "f": "f", "r": "r",
+    " ": " ",
+  };
+
+  const els = {
+    baseUrl: document.getElementById("base-url"),
+    connectBtn: document.getElementById("connect-btn"),
+    connDot: document.getElementById("conn-dot"),
+    connLabel: document.getElementById("conn-label"),
+    videoFeed: document.getElementById("video-feed"),
+    videoPlaceholder: document.getElementById("video-placeholder"),
+    controlLog: document.getElementById("control-log"),
+    lowVoltageBanner: document.getElementById("low-voltage-banner"),
+    fields: {
+      cpuTemp: document.getElementById("f-cpu-temp"),
+      thermoTemp: document.getElementById("f-thermo-temp"),
+      battVoltage: document.getElementById("f-batt-voltage"),
+      battCurrent: document.getElementById("f-batt-current"),
+      battCapacity: document.getElementById("f-batt-capacity"),
+      wheelRpm: document.getElementById("f-wheel-rpm"),
+      wheelSpeed: document.getElementById("f-wheel-speed"),
+      wheelDir: document.getElementById("f-wheel-dir"),
+    },
+  };
+
+  let baseUrl = null;
+  let connected = false;
+  let statusTimer = null;
+  let heartbeatTimer = null;
+
+  function normalizeBaseUrl(raw) {
+    return raw.trim().replace(/\/+$/, "");
+  }
+
+  function setConnLabel(text, cls) {
+    els.connLabel.textContent = text;
+    els.connDot.className = cls || "";
+  }
+
+  function estimateBadge(isEstimated) {
+    return isEstimated ? '<span class="badge">estimated</span>' : "";
+  }
+
+  function renderStatus(data) {
+    const f = els.fields;
+    f.cpuTemp.textContent = data.cpu_temp_c != null ? `${data.cpu_temp_c.toFixed(1)} °C` : "unavailable";
+
+    const thermo = data.thermocouple || {};
+    f.thermoTemp.innerHTML = thermo.temp_c != null
+      ? `${thermo.temp_c.toFixed(2)} °C${estimateBadge(thermo.is_estimated)}`
+      : "unavailable";
+
+    const batt = data.battery || {};
+    f.battVoltage.textContent = batt.voltage_v != null ? `${batt.voltage_v.toFixed(2)} V` : "unavailable";
+    f.battCurrent.innerHTML = batt.current_a != null
+      ? `${batt.current_a.toFixed(3)} A${estimateBadge(batt.current_is_estimated)}`
+      : "unavailable";
+    f.battCapacity.textContent = batt.capacity_percent != null ? `${batt.capacity_percent.toFixed(1)}%` : "unavailable";
+    els.lowVoltageBanner.style.display = batt.low_voltage ? "block" : "none";
+
+    const wheel = data.wheel_speed || {};
+    f.wheelRpm.textContent = wheel.rpm != null ? wheel.rpm.toFixed(1) : "-";
+    f.wheelSpeed.textContent = wheel.speed_ms != null ? `${wheel.speed_ms.toFixed(2)} m/s` : "-";
+    f.wheelDir.textContent = wheel.direction != null ? wheel.direction : "-";
+  }
+
+  async function refreshStatus() {
+    try {
+      const res = await fetch(`${baseUrl}/status`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      renderStatus(await res.json());
+      setConnLabel(`Connected: ${baseUrl}`, "ok");
+    } catch (err) {
+      setConnLabel(`Status unavailable (${err.message})`, "bad");
+    }
+  }
+
+  function sendHeartbeat() {
+    fetch(`${baseUrl}/heartbeat`, { method: "POST" }).catch(() => {});
+  }
+
+  async function sendControlKey(key) {
+    try {
+      const res = await fetch(`${baseUrl}/control`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ key }),
+      });
+      const data = await res.json();
+      els.controlLog.textContent = (data.handled ? "sent: " : "ignored: ") + key;
+    } catch (err) {
+      els.controlLog.textContent = "control error: " + err.message;
+    }
+  }
+
+  function connect() {
+    const raw = els.baseUrl.value;
+    if (!raw) return;
+    baseUrl = normalizeBaseUrl(raw);
+    localStorage.setItem("roverBaseUrl", baseUrl);
+
+    els.videoFeed.src = `${baseUrl}/video`;
+    els.videoFeed.style.display = "block";
+    els.videoPlaceholder.style.display = "none";
+
+    connected = true;
+    els.connectBtn.textContent = "Disconnect";
+    els.connectBtn.classList.add("disconnect");
+
+    refreshStatus();
+    statusTimer = setInterval(refreshStatus, STATUS_POLL_MS);
+    heartbeatTimer = setInterval(sendHeartbeat, HEARTBEAT_MS);
+    sendHeartbeat();
+  }
+
+  function disconnect() {
+    connected = false;
+    clearInterval(statusTimer);
+    clearInterval(heartbeatTimer);
+    // Stop sending heartbeats so the rover's own watchdog stops the motor;
+    // this page doesn't call /control itself to force a stop, since it may
+    // be talking to a rover with no motor/control_handler configured.
+    els.videoFeed.src = "";
+    els.videoFeed.style.display = "none";
+    els.videoPlaceholder.style.display = "block";
+    els.connectBtn.textContent = "Connect";
+    els.connectBtn.classList.remove("disconnect");
+    setConnLabel("Disconnected");
+  }
+
+  els.connectBtn.addEventListener("click", () => {
+    if (connected) {
+      disconnect();
+    } else {
+      connect();
+    }
+  });
+
+  window.addEventListener("keydown", (event) => {
+    if (!connected) return;
+    const key = CONTROL_KEY_MAP[event.key];
+    if (key === undefined) return;
+    event.preventDefault();
+    sendControlKey(key);
+  });
+
+  const savedUrl = localStorage.getItem("roverBaseUrl");
+  if (savedUrl) els.baseUrl.value = savedUrl;
+})();
+</script>
+
+</body>
+</html>
