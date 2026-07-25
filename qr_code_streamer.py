@@ -34,6 +34,7 @@ height and checking that the reported Y has the sign you expect.
 """
 
 import math
+import threading
 import time
 
 import cv2
@@ -65,8 +66,11 @@ _STATUS_BODY = """
 """
 
 # Maps a browser KeyboardEvent.key to the key strings KeyboardMotorController
-# understands (see drivetrain.py: "w"/"s"/"f"/"r"/" "/"up"/"down").
-_CONTROL_HEAD = """
+# understands (see drivetrain.py: "w"/"s"/"f"/"r"/" "/"up"/"down"). The
+# heartbeat interval is filled in per-instance (see _index()) from
+# control_timeout_s, so it stays comfortably below the server's watchdog
+# timeout.
+_CONTROL_HEAD_TEMPLATE = """
 <script>
     const CONTROL_KEY_MAP = {
         "w": "w", "ArrowUp": "up",
@@ -97,12 +101,21 @@ _CONTROL_HEAD = """
         event.preventDefault();  // stop space/arrows from scrolling the page
         sendControlKey(key);
     });
+
+    // Keeps the server-side motor watchdog alive as long as this page stays
+    // open and connected, independent of whether a movement key is
+    // currently pressed - holding a steady speed shouldn't trip the
+    // watchdog, only closing the tab or losing the connection should.
+    setInterval(() => {
+        fetch("/heartbeat", {method: "POST"}).catch(() => {});
+    }, __HEARTBEAT_INTERVAL_MS__);
 </script>
 """
 
 _CONTROL_BODY = """
 <p>Keyboard controls (click the page once so it has focus):
 w/&uarr; faster, s/&darr; slower, f forward, r reverse, space stop</p>
+<p><small>The motor stops automatically if this page disconnects.</small></p>
 <div id="control-log">no commands sent yet</div>
 """
 
@@ -144,6 +157,14 @@ class QRCodeStreamer:
     viewing the page drives the motor - no on-screen buttons to click.
     main.py wires this to a KeyboardMotorController.handle_key, again
     without this module needing to import drivetrain.py directly.
+
+    Whenever control_handler is set, a background watchdog also stops the
+    motor (by calling control_handler(" ")) if control_timeout_s seconds
+    pass without any /control or /heartbeat request - the dashboard page
+    sends a heartbeat on an interval independent of actual keypresses, so
+    the motor keeps running at a steady commanded speed while the page is
+    just sitting there, but stops automatically if the tab closes or the
+    connection drops.
     """
 
     def __init__(
@@ -157,6 +178,7 @@ class QRCodeStreamer:
         mount_tilt_deg=6.4,
         status_provider=None,
         control_handler=None,
+        control_timeout_s=2.0,
     ):
         self.qr_size_m = qr_size_m
         self.capture_size = capture_size
@@ -166,6 +188,9 @@ class QRCodeStreamer:
         self.mount_tilt_deg = mount_tilt_deg
         self._status_provider = status_provider
         self._control_handler = control_handler
+        self._control_timeout_s = control_timeout_s
+        self._control_lock = threading.Lock()
+        self._last_control_seen = None
 
         data = np.load(calib_file)
         self.camera_matrix = data["camera_matrix"]
@@ -193,6 +218,8 @@ class QRCodeStreamer:
             self.app.add_url_rule("/status", "status", self._status)
         if self._control_handler is not None:
             self.app.add_url_rule("/control", "control", self._control, methods=["POST"])
+            self.app.add_url_rule("/heartbeat", "heartbeat", self._heartbeat, methods=["POST"])
+            self._start_control_watchdog()
 
     def start_camera(self):
         """Open the Pi Camera and compute the undistortion map. Safe to call
@@ -218,6 +245,32 @@ class QRCodeStreamer:
         self._picam2 = picam2
         self._new_camera_matrix = new_camera_matrix
         self._qr_detector = cv2.QRCodeDetector()
+
+    def _start_control_watchdog(self):
+        """Background daemon thread: stop the motor if no /control or
+        /heartbeat request has arrived in control_timeout_s seconds."""
+
+        def _watch():
+            while True:
+                time.sleep(self._control_timeout_s / 2)
+                with self._control_lock:
+                    last_seen = self._last_control_seen
+                if last_seen is None:
+                    continue  # no client has connected yet
+                if time.monotonic() - last_seen > self._control_timeout_s:
+                    print(
+                        f"WARNING: no /control or /heartbeat received in "
+                        f"{self._control_timeout_s:.1f}s; stopping motor for safety"
+                    )
+                    self._control_handler(" ")
+                    with self._control_lock:
+                        self._last_control_seen = None  # don't re-stop every cycle while disconnected
+
+        threading.Thread(target=_watch, daemon=True).start()
+
+    def _touch_control(self):
+        with self._control_lock:
+            self._last_control_seen = time.monotonic()
 
     def stop_camera(self):
         if self._picam2 is not None:
@@ -301,7 +354,10 @@ class QRCodeStreamer:
             head += _STATUS_HEAD
             body += _STATUS_BODY
         if self._control_handler is not None:
-            head += _CONTROL_HEAD
+            heartbeat_interval_ms = int(max(self._control_timeout_s * 1000 / 3, 100))
+            head += _CONTROL_HEAD_TEMPLATE.replace(
+                "__HEARTBEAT_INTERVAL_MS__", str(heartbeat_interval_ms)
+            )
             body += _CONTROL_BODY
 
         title = "Rover Dashboard" if head else "QR Distance Scanner"
@@ -324,10 +380,15 @@ class QRCodeStreamer:
         return jsonify(self._status_provider())
 
     def _control(self):
+        self._touch_control()
         payload = request.get_json(silent=True) or {}
         key = payload.get("key")
         handled = bool(key) and self._control_handler(key)
         return jsonify({"handled": handled})
+
+    def _heartbeat(self):
+        self._touch_control()
+        return jsonify({"ok": True})
 
     def _video(self):
         return Response(
