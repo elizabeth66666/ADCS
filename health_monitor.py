@@ -27,6 +27,7 @@ import re
 import subprocess
 import threading
 import time
+from collections import deque
 
 from ina219 import INA219
 from max31855 import AdafruitMAX31855
@@ -176,6 +177,11 @@ class BatteryMonitor(threading.Thread):
     BATTERY_MINIMUM_VOLTAGE at startup does not exit the process - it sets
     .low_voltage instead, since one drained battery shouldn't take down
     the whole health monitor. main.py should check .low_voltage itself.
+
+    If a current reading fails (I2C glitch, loose wiring, etc.), the current
+    draw is estimated from the average of the last `current_estimate_window`
+    good readings instead of raising - callers can check .current_is_estimated
+    to see whether the latest current_a is a real reading or an estimate.
     """
 
     def __init__(
@@ -187,6 +193,8 @@ class BatteryMonitor(threading.Thread):
         i2c_bus=1,
         state_file="battery_state.txt",
         update_interval_s=1.0,
+        current_estimate_window=10,
+        fallback_current_a=0.0,
     ):
         super().__init__(daemon=True)
         self._capacity_ah = capacity_ah
@@ -194,6 +202,7 @@ class BatteryMonitor(threading.Thread):
         self._minimum_voltage = minimum_voltage
         self._state_file = state_file
         self._update_interval_s = update_interval_s
+        self._fallback_current_a = fallback_current_a
 
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
@@ -202,6 +211,10 @@ class BatteryMonitor(threading.Thread):
         self._capacity_percent = None
         self._voltage_percent = None
         self._low_voltage = False
+        self._current_is_estimated = False
+
+        self._recent_currents_a = deque(maxlen=current_estimate_window)
+        self._last_known_voltage = None
 
         self._ina219 = INA219(address=i2c_address, bus_number=i2c_bus)
         if not self._ina219.begin():
@@ -210,7 +223,7 @@ class BatteryMonitor(threading.Thread):
 
         self._remaining_capacity_ah = self._load_initial_capacity()
 
-        starting_voltage = self._ina219.get_bus_voltage_V()
+        starting_voltage = self._read_voltage_v()
         if starting_voltage <= self._minimum_voltage:
             self._low_voltage = True
             print(
@@ -229,9 +242,49 @@ class BatteryMonitor(threading.Thread):
         if os.path.exists(self._state_file):
             with open(self._state_file, "r") as file:
                 return float(file.read())
-        starting_voltage = self._ina219.get_bus_voltage_V()
+        starting_voltage = self._read_voltage_v()
         starting_percent = self._voltage_to_percent(starting_voltage)
         return (starting_percent / 100) * self._capacity_ah
+
+    def _read_current_a(self):
+        """Read current draw from the INA219, in amps.
+
+        Returns (current_a, is_estimated). On a successful read, the value
+        feeds the rolling history used for future estimates. On failure,
+        falls back to the average of recent good readings (or
+        fallback_current_a if there's no history yet) rather than raising -
+        an exception here would otherwise kill this whole thread.
+        """
+        try:
+            current_a = self._ina219.get_current_mA() / 1000
+        except Exception as exc:
+            estimated_a = (
+                sum(self._recent_currents_a) / len(self._recent_currents_a)
+                if self._recent_currents_a
+                else self._fallback_current_a
+            )
+            print(
+                f"WARNING: INA219 current read failed ({exc}); "
+                f"estimating {estimated_a:.3f} A from recent history"
+            )
+            return estimated_a, True
+
+        self._recent_currents_a.append(current_a)
+        return current_a, False
+
+    def _read_voltage_v(self):
+        """Read bus voltage from the INA219, falling back to the last known
+        good voltage (or full_voltage if there isn't one yet) on failure, so
+        a transient I2C error doesn't kill this thread either."""
+        try:
+            voltage = self._ina219.get_bus_voltage_V()
+        except Exception as exc:
+            voltage = self._last_known_voltage if self._last_known_voltage is not None else self._full_voltage
+            print(f"WARNING: INA219 voltage read failed ({exc}); holding last value {voltage:.2f} V")
+            return voltage
+
+        self._last_known_voltage = voltage
+        return voltage
 
     @property
     def voltage(self):
@@ -263,6 +316,11 @@ class BatteryMonitor(threading.Thread):
         with self._lock:
             return self._low_voltage
 
+    @property
+    def current_is_estimated(self):
+        with self._lock:
+            return self._current_is_estimated
+
     def run(self):
         last_time = time.monotonic()
         while not self._stop_event.is_set():
@@ -270,8 +328,8 @@ class BatteryMonitor(threading.Thread):
             elapsed_hours = (now - last_time) / 3600
             last_time = now
 
-            current_a = self._ina219.get_current_mA() / 1000
-            voltage = self._ina219.get_bus_voltage_V()
+            current_a, current_is_estimated = self._read_current_a()
+            voltage = self._read_voltage_v()
             remaining_capacity_ah = max(
                 0, self._remaining_capacity_ah - current_a * elapsed_hours
             )
@@ -279,6 +337,7 @@ class BatteryMonitor(threading.Thread):
             with self._lock:
                 self._remaining_capacity_ah = remaining_capacity_ah
                 self._current_a = current_a
+                self._current_is_estimated = current_is_estimated
                 self._voltage = voltage
                 self._capacity_percent = max(
                     0, min(100, (remaining_capacity_ah / self._capacity_ah) * 100)
@@ -338,8 +397,9 @@ class HealthMonitor:
 
         voltage = self.battery.voltage
         if voltage is not None:
+            current_note = " (estimated)" if self.battery.current_is_estimated else ""
             print(
-                f"Battery: {voltage:.2f} V, {self.battery.current_a:.3f} A, "
+                f"Battery: {voltage:.2f} V, {self.battery.current_a:.3f} A{current_note}, "
                 f"{self.battery.capacity_percent:.1f}% capacity"
             )
         if self.battery.low_voltage:
