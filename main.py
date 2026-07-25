@@ -20,11 +20,13 @@ What runs, and how
   that telemetry as JSON; its dashboard page - at
   http://<this device's IP>:5000/ - polls /status once a second and shows
   it next to the live camera stream with QR pose overlaid.
-- Motor control is intentionally not started here: Drivetrain's keyboard
-  controller (KeyboardMotorController) reads from this process's own
-  terminal, which doesn't apply once this is running as a network-facing
-  background service. Run `python3 drivetrain.py` directly instead for
-  local keyboard control.
+- Motor control is keyboard-driven from whatever device has the dashboard
+  page open, not from this process's own terminal: the page listens for
+  keydown events (w/up faster, s/down slower, f forward, r reverse, space
+  stop) and POSTs them to /control, which calls
+  Drivetrain.keyboard.handle_key() - no on-screen buttons to click. Run
+  `python3 drivetrain.py` directly instead if you want local terminal
+  keyboard control (SSH'd into this device) rather than browser-based.
 
 Ctrl+C stops every subsystem and releases the camera/GPIO/SPI/I2C handles.
 """
@@ -71,10 +73,13 @@ def main():
 
     health = HealthMonitor()
     drivetrain = Drivetrain()
-    streamer = QRCodeStreamer(status_provider=lambda: _status_payload(health, drivetrain))
+    streamer = QRCodeStreamer(
+        status_provider=lambda: _status_payload(health, drivetrain),
+        control_handler=drivetrain.keyboard.handle_key,
+    )
 
     health.start()
-    drivetrain.start()  # background wheel-speed monitoring only, no keyboard control
+    drivetrain.start()  # background wheel-speed monitoring; motor is driven via /control instead
 
     print(f"Dashboard starting at http://<this device's IP>:{streamer.port}/")
     try:

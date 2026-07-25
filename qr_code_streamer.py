@@ -38,8 +38,73 @@ import time
 
 import cv2
 import numpy as np
-from flask import Flask, Response, jsonify
+from flask import Flask, Response, jsonify, request
 from picamera2 import Picamera2
+
+
+_STATUS_HEAD = """
+<script>
+    async function refreshStatus() {
+        try {
+            const res = await fetch("/status");
+            const data = await res.json();
+            document.getElementById("status").textContent =
+                JSON.stringify(data, null, 2);
+        } catch (err) {
+            document.getElementById("status").textContent =
+                "status unavailable: " + err;
+        }
+    }
+    setInterval(refreshStatus, 1000);
+    window.addEventListener("load", refreshStatus);
+</script>
+"""
+
+_STATUS_BODY = """
+<pre id="status">loading status...</pre>
+"""
+
+# Maps a browser KeyboardEvent.key to the key strings KeyboardMotorController
+# understands (see drivetrain.py: "w"/"s"/"f"/"r"/" "/"up"/"down").
+_CONTROL_HEAD = """
+<script>
+    const CONTROL_KEY_MAP = {
+        "w": "w", "ArrowUp": "up",
+        "s": "s", "ArrowDown": "down",
+        "f": "f", "r": "r",
+        " ": " ",
+    };
+
+    async function sendControlKey(key) {
+        try {
+            const res = await fetch("/control", {
+                method: "POST",
+                headers: {"Content-Type": "application/json"},
+                body: JSON.stringify({key: key}),
+            });
+            const data = await res.json();
+            document.getElementById("control-log").textContent =
+                (data.handled ? "sent: " : "ignored: ") + key;
+        } catch (err) {
+            document.getElementById("control-log").textContent =
+                "control error: " + err;
+        }
+    }
+
+    window.addEventListener("keydown", (event) => {
+        const key = CONTROL_KEY_MAP[event.key];
+        if (key === undefined) return;
+        event.preventDefault();  // stop space/arrows from scrolling the page
+        sendControlKey(key);
+    });
+</script>
+"""
+
+_CONTROL_BODY = """
+<p>Keyboard controls (click the page once so it has focus):
+w/&uarr; faster, s/&darr; slower, f forward, r reverse, space stop</p>
+<div id="control-log">no commands sent yet</div>
+"""
 
 
 def _tilt_rotation_matrix(tilt_deg):
@@ -71,6 +136,14 @@ class QRCodeStreamer:
     the dashboard page next to the video - e.g. main.py wires this up to
     report health_monitor/drivetrain telemetry alongside the camera feed,
     without this module needing to import either of those.
+
+    Pass control_handler (a callable taking one key string - "w"/"s"/"f"/
+    "r"/" "/"up"/"down" - and returning whether it did anything) to also
+    accept POST /control {"key": "..."} requests and add a keydown listener
+    to the dashboard page, so a physical keyboard on whatever device is
+    viewing the page drives the motor - no on-screen buttons to click.
+    main.py wires this to a KeyboardMotorController.handle_key, again
+    without this module needing to import drivetrain.py directly.
     """
 
     def __init__(
@@ -83,6 +156,7 @@ class QRCodeStreamer:
         port=5000,
         mount_tilt_deg=6.4,
         status_provider=None,
+        control_handler=None,
     ):
         self.qr_size_m = qr_size_m
         self.capture_size = capture_size
@@ -91,6 +165,7 @@ class QRCodeStreamer:
         self.port = port
         self.mount_tilt_deg = mount_tilt_deg
         self._status_provider = status_provider
+        self._control_handler = control_handler
 
         data = np.load(calib_file)
         self.camera_matrix = data["camera_matrix"]
@@ -116,6 +191,8 @@ class QRCodeStreamer:
         self.app.add_url_rule("/video", "video", self._video)
         if self._status_provider is not None:
             self.app.add_url_rule("/status", "status", self._status)
+        if self._control_handler is not None:
+            self.app.add_url_rule("/control", "control", self._control, methods=["POST"])
 
     def start_camera(self):
         """Open the Pi Camera and compute the undistortion map. Safe to call
@@ -217,45 +294,40 @@ class QRCodeStreamer:
             )
 
     def _index(self):
-        if self._status_provider is None:
-            return """
-            <html>
-                <body>
-                    <h1>QR Distance Scanner</h1>
-                    <img src="/video">
-                </body>
-            </html>
-            """
-        return """
+        head = ""
+        body = ""
+
+        if self._status_provider is not None:
+            head += _STATUS_HEAD
+            body += _STATUS_BODY
+        if self._control_handler is not None:
+            head += _CONTROL_HEAD
+            body += _CONTROL_BODY
+
+        title = "Rover Dashboard" if head else "QR Distance Scanner"
+
+        return f"""
         <html>
             <head>
-                <title>Rover Dashboard</title>
-                <script>
-                    async function refreshStatus() {
-                        try {
-                            const res = await fetch("/status");
-                            const data = await res.json();
-                            document.getElementById("status").textContent =
-                                JSON.stringify(data, null, 2);
-                        } catch (err) {
-                            document.getElementById("status").textContent =
-                                "status unavailable: " + err;
-                        }
-                    }
-                    setInterval(refreshStatus, 1000);
-                    window.addEventListener("load", refreshStatus);
-                </script>
+                <title>{title}</title>
+                {head}
             </head>
             <body>
-                <h1>Rover Dashboard</h1>
+                <h1>{title}</h1>
                 <img src="/video">
-                <pre id="status">loading status...</pre>
+                {body}
             </body>
         </html>
         """
 
     def _status(self):
         return jsonify(self._status_provider())
+
+    def _control(self):
+        payload = request.get_json(silent=True) or {}
+        key = payload.get("key")
+        handled = bool(key) and self._control_handler(key)
+        return jsonify({"handled": handled})
 
     def _video(self):
         return Response(

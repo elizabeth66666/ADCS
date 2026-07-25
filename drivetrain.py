@@ -209,16 +209,25 @@ def read_key(fd, timeout=0.1):
 
 
 class KeyboardMotorController:
-    """Drives an L298N motor from raw terminal keypresses, exactly like
-    motor_control.py: w/up = faster, s/down = slower, f = forward, r = reverse,
-    space = stop, q = quit. If a WheelSpeedMonitor is attached, prints its
-    live reading after every keypress."""
+    """Drives an L298N motor from keypresses, exactly like motor_control.py:
+    w/up = faster, s/down = slower, f = forward, r = reverse, space = stop,
+    q = quit. If a WheelSpeedMonitor is attached, prints its live reading
+    after every keypress.
+
+    handle_key() is the shared dispatch used both by run_blocking() (local
+    terminal, one thread) and by a remote controller such as
+    qr_code_streamer.py's /control endpoint (HTTP requests, each handled on
+    its own thread under Flask's threaded dev server) - a lock around the
+    actual motor call keeps those two sources of keypresses from racing on
+    the motor's direction/speed state.
+    """
 
     SPEED_STEP = 10
 
     def __init__(self, motor, speed_monitor=None):
         self.motor = motor
         self.speed_monitor = speed_monitor
+        self._lock = threading.Lock()
         self._actions = {
             "w": self._increase_speed,
             "up": self._increase_speed,
@@ -259,6 +268,20 @@ class KeyboardMotorController:
             f"Direction: {self.speed_monitor.direction}"
         )
 
+    def handle_key(self, key):
+        """Dispatch one key - "w"/"s"/"f"/"r"/" ", or an ARROW_KEYS value
+        ("up"/"down") - to the matching motor action. Returns True if the
+        key mapped to an action, False otherwise (e.g. "q" or an
+        unrecognized key, which this method ignores; run_blocking() handles
+        "q" itself since only a local terminal session has a loop to quit)."""
+        action = self._actions.get(key)
+        if action is None:
+            return False
+        with self._lock:
+            action()
+        self._print_speed_reading()
+        return True
+
     def run_blocking(self):
         """Read keys from this terminal until 'q' is pressed. Blocks the calling
         thread and restores terminal settings before returning."""
@@ -276,10 +299,7 @@ class KeyboardMotorController:
                     continue
                 if key == "q":
                     break
-                action = self._actions.get(key)
-                if action is not None:
-                    action()
-                    self._print_speed_reading()
+                self.handle_key(key)
         finally:
             termios.tcsetattr(fd, termios.TCSADRAIN, old_terminal_settings)
 
