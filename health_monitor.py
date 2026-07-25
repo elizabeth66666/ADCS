@@ -92,25 +92,43 @@ class CPUTempMonitor(threading.Thread):
 class ThermocoupleMonitor(threading.Thread):
     """Background thread polling a MAX31855 thermocouple amplifier over SPI.
 
-    If a reading is NaN (open circuit / short to VCC / short to GND), .ok
-    becomes False and .fault_code holds the MAX31855 error byte instead of
-    raising - callers decide how to react (e.g. treat as a sensor fault
-    rather than crashing the whole health monitor).
+    If the thermocouple isn't accessible - SPI init fails at startup, a read
+    raises (bus glitch, loose wiring), or the chip itself reports a fault
+    (NaN reading: open circuit / short to VCC / short to GND) - temp_c/temp_f
+    fall back to an estimate instead of raising or going unusable: the
+    average of the last `temp_estimate_window` good readings, or
+    fallback_temp_c if there's no history yet (e.g. it was never reachable).
+    Check .temp_is_estimated to tell a real reading from an estimate; a
+    startup failure no longer raises, so this thread keeps retrying instead
+    of taking down the whole health monitor. .fault_code stays available as
+    a diagnostic for the specific MAX31855-reported fault, when there is one.
     """
 
-    def __init__(self, bus=0, device=0, update_interval_s=1.0):
+    def __init__(
+        self,
+        bus=0,
+        device=0,
+        update_interval_s=1.0,
+        temp_estimate_window=10,
+        fallback_temp_c=25.0,
+    ):
         super().__init__(daemon=True)
+        self._bus = bus
+        self._device = device
         self._update_interval_s = update_interval_s
+        self._fallback_temp_c = fallback_temp_c
+
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
         self._temp_c = None
         self._temp_f = None
         self._internal_temp_c = None
         self._fault_code = None
+        self._temp_is_estimated = False
 
-        self._sensor = AdafruitMAX31855(bus=bus, device=device)
-        if not self._sensor.begin():
-            raise RuntimeError("Could not initialize thermocouple SPI")
+        self._recent_temps_c = deque(maxlen=temp_estimate_window)
+        self._sensor = None
+        self._ensure_sensor()
 
     @property
     def temp_c(self):
@@ -133,26 +151,70 @@ class ThermocoupleMonitor(threading.Thread):
             return self._fault_code
 
     @property
+    def temp_is_estimated(self):
+        with self._lock:
+            return self._temp_is_estimated
+
+    @property
     def ok(self):
         with self._lock:
-            return self._fault_code is None
+            return not self._temp_is_estimated
+
+    def _ensure_sensor(self):
+        """(Re)open the SPI connection if it isn't already open. Returns
+        True if the sensor is usable. Safe to call repeatedly - a device
+        that's currently unreachable is retried on every call rather than
+        raising, so a loose wire reconnected later is picked back up."""
+        if self._sensor is not None:
+            return True
+        try:
+            sensor = AdafruitMAX31855(bus=self._bus, device=self._device)
+            if not sensor.begin():
+                raise RuntimeError("MAX31855 begin() failed")
+        except Exception as exc:
+            print(f"WARNING: thermocouple not accessible ({exc}); estimating instead")
+            return False
+        self._sensor = sensor
+        return True
+
+    def _estimate_temp_c(self):
+        if self._recent_temps_c:
+            return sum(self._recent_temps_c) / len(self._recent_temps_c)
+        return self._fallback_temp_c
 
     def run(self):
         while not self._stop_event.is_set():
-            temp_c = self._sensor.read_celsius()
-            internal_temp_c = self._sensor.read_internal()
-            fault_code = None
+            temp_c = None
             temp_f = None
-            if math.isnan(temp_c):
-                fault_code = self._sensor.read_error()
+            internal_temp_c = None
+            fault_code = None
+
+            if self._ensure_sensor():
+                try:
+                    temp_c = self._sensor.read_celsius()
+                    internal_temp_c = self._sensor.read_internal()
+                    if math.isnan(temp_c):
+                        fault_code = self._sensor.read_error()
+                    else:
+                        temp_f = self._sensor.read_fahrenheit()
+                except Exception as exc:
+                    print(f"WARNING: thermocouple read failed ({exc}); estimating instead")
+                    self._sensor = None  # force a fresh _ensure_sensor() next cycle
+                    temp_c = None
+
+            is_estimated = temp_c is None or math.isnan(temp_c)
+            if is_estimated:
+                temp_c = self._estimate_temp_c()
+                temp_f = temp_c * 9.0 / 5.0 + 32.0
             else:
-                temp_f = self._sensor.read_fahrenheit()
+                self._recent_temps_c.append(temp_c)
 
             with self._lock:
                 self._temp_c = temp_c
                 self._temp_f = temp_f
                 self._internal_temp_c = internal_temp_c
                 self._fault_code = fault_code
+                self._temp_is_estimated = is_estimated
 
             self._stop_event.wait(self._update_interval_s)
 
@@ -160,9 +222,11 @@ class ThermocoupleMonitor(threading.Thread):
         self._stop_event.set()
 
     def close(self):
-        """Release the SPI handle. Call after stop()+join(), not before -
-        the poll loop needs the sensor open for its whole lifetime."""
-        self._sensor.close()
+        """Release the SPI handle, if one is currently open. Call after
+        stop()+join(), not before - the poll loop needs the sensor open for
+        its whole lifetime."""
+        if self._sensor is not None:
+            self._sensor.close()
 
 
 # ---- Battery / INA219 --------------------------------------------------------
@@ -384,13 +448,18 @@ class HealthMonitor:
         cpu_temp = self.cpu_temp.temp_c
         print(f"CPU Temp: {cpu_temp:.1f}°C" if cpu_temp is not None else "CPU Temp: unavailable")
 
-        if self.thermocouple.ok:
+        thermo_temp_c = self.thermocouple.temp_c
+        if thermo_temp_c is not None:
+            temp_note = " (estimated)" if self.thermocouple.temp_is_estimated else ""
             print(
-                f"Thermocouple: {self.thermocouple.temp_c:.2f}°C "
-                f"({self.thermocouple.temp_f:.2f}°F)"
+                f"Thermocouple: {thermo_temp_c:.2f}°C "
+                f"({self.thermocouple.temp_f:.2f}°F){temp_note}"
             )
         else:
-            print(f"Thermocouple fault: 0x{self.thermocouple.fault_code:02X}")
+            print("Thermocouple: unavailable")
+        fault_code = self.thermocouple.fault_code
+        if fault_code is not None:
+            print(f"Thermocouple fault code: 0x{fault_code:02X}")
         internal_temp = self.thermocouple.internal_temp_c
         if internal_temp is not None:
             print(f"Thermocouple internal temp: {internal_temp:.2f}°C")
