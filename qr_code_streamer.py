@@ -38,7 +38,7 @@ import time
 
 import cv2
 import numpy as np
-from flask import Flask, Response
+from flask import Flask, Response, jsonify
 from picamera2 import Picamera2
 
 
@@ -64,7 +64,14 @@ def _tilt_rotation_matrix(tilt_deg):
 class QRCodeStreamer:
     """Serves an MJPEG stream at /video (and a viewer page at /) from the Pi
     Camera, drawing the outline, decoded text, and estimated X/Y/Z position
-    (in metres, corrected for camera mounting tilt) of any QR code it sees."""
+    (in metres, corrected for camera mounting tilt) of any QR code it sees.
+
+    Pass status_provider (a zero-argument callable returning a JSON-
+    serializable dict) to also serve that data at /status and show it on
+    the dashboard page next to the video - e.g. main.py wires this up to
+    report health_monitor/drivetrain telemetry alongside the camera feed,
+    without this module needing to import either of those.
+    """
 
     def __init__(
         self,
@@ -75,6 +82,7 @@ class QRCodeStreamer:
         host="0.0.0.0",
         port=5000,
         mount_tilt_deg=6.4,
+        status_provider=None,
     ):
         self.qr_size_m = qr_size_m
         self.capture_size = capture_size
@@ -82,6 +90,7 @@ class QRCodeStreamer:
         self.host = host
         self.port = port
         self.mount_tilt_deg = mount_tilt_deg
+        self._status_provider = status_provider
 
         data = np.load(calib_file)
         self.camera_matrix = data["camera_matrix"]
@@ -105,6 +114,8 @@ class QRCodeStreamer:
         self.app = Flask(__name__)
         self.app.add_url_rule("/", "index", self._index)
         self.app.add_url_rule("/video", "video", self._video)
+        if self._status_provider is not None:
+            self.app.add_url_rule("/status", "status", self._status)
 
     def start_camera(self):
         """Open the Pi Camera and compute the undistortion map. Safe to call
@@ -206,14 +217,45 @@ class QRCodeStreamer:
             )
 
     def _index(self):
+        if self._status_provider is None:
+            return """
+            <html>
+                <body>
+                    <h1>QR Distance Scanner</h1>
+                    <img src="/video">
+                </body>
+            </html>
+            """
         return """
         <html>
+            <head>
+                <title>Rover Dashboard</title>
+                <script>
+                    async function refreshStatus() {
+                        try {
+                            const res = await fetch("/status");
+                            const data = await res.json();
+                            document.getElementById("status").textContent =
+                                JSON.stringify(data, null, 2);
+                        } catch (err) {
+                            document.getElementById("status").textContent =
+                                "status unavailable: " + err;
+                        }
+                    }
+                    setInterval(refreshStatus, 1000);
+                    window.addEventListener("load", refreshStatus);
+                </script>
+            </head>
             <body>
-                <h1>QR Distance Scanner</h1>
+                <h1>Rover Dashboard</h1>
                 <img src="/video">
+                <pre id="status">loading status...</pre>
             </body>
         </html>
         """
+
+    def _status(self):
+        return jsonify(self._status_provider())
 
     def _video(self):
         return Response(
